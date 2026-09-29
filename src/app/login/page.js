@@ -18,6 +18,25 @@ export default function LoginPage() {
   const [samlLoginLabel, setSamlLoginLabel] = useState("Sign in with SAML SSO");
   const [mustChange, setMustChange] = useState(false);
   const [newPassword, setNewPassword] = useState("");
+  const [version, setVersion] = useState("");
+
+  // Version badge is decorative — a failed lookup must never block the login flow.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/version");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled && data?.currentVersion) setVersion(data.currentVersion);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Countdown for rate-limit
   useEffect(() => {
@@ -156,6 +175,9 @@ export default function LoginPage() {
       <div className="relative z-10 w-full max-w-md">
         <div className="text-center mb-8">
           <h1 className="text-3xl font-bold text-primary mb-2">9Router</h1>
+          {version && (
+            <p className="-mt-1 mb-2 text-xs text-text-muted opacity-70">v{version}</p>
+          )}
           <p className="text-text-muted">
             {samlAvailable
               ? "Sign in with SAML 2.0 Single Sign-On"

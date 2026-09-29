@@ -9,10 +9,23 @@ const tracingRoot = process.env.NEXT_TRACING_ROOT_MODE === "workspace"
   : projectRoot;
 const proxyClientMaxBodySize = process.env.NINEROUTER_PROXY_CLIENT_MAX_BODY_SIZE || "128mb";
 
+// Next.js 16 rejects cross-origin requests to the dev server (including
+// /_next/static chunk and HMR requests) unless the origin is allowlisted — the
+// browser then loads the HTML but never a single script, leaving client pages
+// stuck on their initial "Loading..." state. Reaching the dashboard through a
+// tunnel/container hostname (Cloudflare, Tailscale, docker, remote sandbox)
+// hits exactly that. Comma-separated list, wildcards allowed:
+//   NEXT_ALLOWED_DEV_ORIGINS="*.ts.net,*.e2b.app,dashboard.internal"
+const allowedDevOrigins = (process.env.NEXT_ALLOWED_DEV_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   distDir: process.env.NEXT_DIST_DIR || ".next",
   output: "standalone",
+  ...(allowedDevOrigins.length ? { allowedDevOrigins } : {}),
   // `open` must stay external. It derives its own directory from `import.meta.url`, and
   // webpack replaces that with the absolute path of the BUILD machine as a string literal.
   // A release built on macOS therefore ships `file:///Users/.../open/index.js`, which
