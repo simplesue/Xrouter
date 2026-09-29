@@ -23,11 +23,24 @@ function loadJwtSecret() {
 
 const SECRET = new TextEncoder().encode(loadJwtSecret());
 
+const SAME_SITE_VALUES = new Set(["lax", "strict", "none"]);
+
+// "lax" is the safe default: it keeps cross-site CSRF out of the box.
+// Set AUTH_COOKIE_SAMESITE=none when the dashboard is legitimately embedded in
+// a cross-site context (an IDE/preview iframe, a portaled embed) — anywhere the
+// session cookie is a third-party cookie and would otherwise never be stored or
+// sent, which shows up as "login succeeds, then bounces straight back to /login".
+export function resolveCookieSameSite() {
+  const raw = (process.env.AUTH_COOKIE_SAMESITE || "lax").trim().toLowerCase();
+  return SAME_SITE_VALUES.has(raw) ? raw : "lax";
+}
+
 export function shouldUseSecureCookie(request) {
   const forceSecureCookie = process.env.AUTH_COOKIE_SECURE === "true";
   const forwardedProto = request?.headers?.get?.("x-forwarded-proto");
   const isHttpsRequest = forwardedProto === "https";
-  return forceSecureCookie || isHttpsRequest;
+  // Browsers reject SameSite=None cookies that are not Secure.
+  return forceSecureCookie || isHttpsRequest || resolveCookieSameSite() === "none";
 }
 
 export async function createDashboardAuthToken(claims = {}) {
@@ -63,7 +76,7 @@ export async function setDashboardAuthCookie(cookieStore, request, claims = {}) 
   cookieStore.set("auth_token", token, {
     httpOnly: true,
     secure: shouldUseSecureCookie(request),
-    sameSite: "lax",
+    sameSite: resolveCookieSameSite(),
     path: "/",
     maxAge: SESSION_MAX_AGE_SEC,
   });
