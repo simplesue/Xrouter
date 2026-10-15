@@ -110,6 +110,54 @@ jobs:
             cat /tmp/tools.txt
           fi
 
+      - name: One-off write test — create README-mcp-probe.md via MCP
+        if: contains(github.event.head_commit.message, '[mcp-write-test]')
+        env:
+          MCP_URL: ${{ secrets.MCP_URL }}
+          MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
+        run: |
+          {
+            hdr=$(mktemp)
+            post() {
+              # $1 = label, $2 = payload -> body on stdout; timing to /tmp/timing.txt
+              curl -sS --max-time 180 -D "$hdr" -o /tmp/wt-body.txt \
+                -w "$1 dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code} bytes=%{size_download}\n" \
+                -X POST "$MCP_URL" \
+                -H "Authorization: Bearer $MCP_TOKEN" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json, text/event-stream' \
+                ${MCP_SID:+-H "Mcp-Session-Id: $MCP_SID"} \
+                --data "$2" >> /tmp/timing.txt || echo "$1 curl_error" >> /tmp/timing.txt
+              cat /tmp/wt-body.txt
+            }
+            echo '--- initialize ---'
+            post wt-initialize '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"xrouter-ci-writetest","version":"0.1.0"}}}' | head -c 600; echo
+            MCP_SID=$(grep -i '^mcp-session-id:' "$hdr" | tr -d '\r' | awk '{print $2}')
+            echo "session: ${MCP_SID:-<none>}"
+            post wt-initialized '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null
+            echo '--- tools/list (for create_file schema) ---'
+            post wt-tools-list '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' > /tmp/wt-tools.txt
+            json=$(grep '^data:' /tmp/wt-tools.txt | tail -1 | sed 's/^data: *//')
+            [ -z "$json" ] && json=$(cat /tmp/wt-tools.txt)
+            schema=$(echo "$json" | jq -c '.result.tools[] | select(.name=="create_file") | .inputSchema' 2>/dev/null)
+            echo "create_file inputSchema: $schema"
+            pathkey=$(echo "$schema" | jq -r '[(.properties // {}) | keys[] | select(test("path"; "i"))][0] // "path"')
+            contentkey=$(echo "$schema" | jq -r '[(.properties // {}) | keys[] | select(test("content|text"; "i"))][0] // "content"')
+            echo "arg keys -> path: $pathkey, content: $contentkey"
+            content=$(printf '# MCP write probe\n\nCreated by a GitHub Actions one-off test through the workspace MCP (create_file).\nPurpose: verify the runner -> MCP server -> local VS Code workspace write path.\nSafe to delete.\n')
+            args=$(jq -n --arg pk "$pathkey" --arg ck "$contentkey" --arg c "$content" '{($pk): "README-mcp-probe.md", ($ck): $c}')
+            echo "--- tools/call create_file README-mcp-probe.md ---"
+            payload=$(jq -n --argjson a "$args" '{jsonrpc:"2.0", id:4, method:"tools/call", params:{name:"create_file", arguments:$a}}')
+            post create_file "$payload" | head -c 2000; echo
+            echo '--- verify: tools/call read_file ---'
+            rschema=$(echo "$json" | jq -c '.result.tools[] | select(.name=="read_file") | .inputSchema' 2>/dev/null)
+            rpathkey=$(echo "$rschema" | jq -r '[(.properties // {}) | keys[] | select(test("path"; "i"))][0] // "path"')
+            rargs=$(jq -n --arg pk "$rpathkey" '{($pk): "README-mcp-probe.md"}')
+            rpayload=$(jq -n --argjson a "$rargs" '{jsonrpc:"2.0", id:5, method:"tools/call", params:{name:"read_file", arguments:$a}}')
+            post read_file "$rpayload" | head -c 2000; echo
+          } > /tmp/writetest.txt 2>&1 || true
+          cat /tmp/writetest.txt
+
       - name: Report via check run (readable over api.github.com)
         if: always()
         env:
@@ -120,8 +168,9 @@ jobs:
           hs=$(head -c 1500 /tmp/handshake.txt 2>/dev/null || echo '<handshake not run>')
           tools=$(head -c 6000 /tmp/tools.txt 2>/dev/null || echo '<tools/list not run>')
           timing=$(cat /tmp/timing.txt 2>/dev/null || echo '<no timing captured>')
+          wt=$(head -c 3000 /tmp/writetest.txt 2>/dev/null || echo '<write test not run>')
           if [ "$code" != "000" ]; then concl=success; else concl=failure; fi
-          summary=$(printf 'Unauthenticated initialize POST -> HTTP %s\n\n```\n%s\n```\n\nTiming per request (seconds; dns/tcp/tls = connection setup, ttfb = until first byte, total = full response):\n\n```\n%s\n```\n\nHandshake log:\n\n```\n%s\n```\n\nTools:\n\n```\n%s\n```' "$code" "$body" "$timing" "$hs" "$tools")
+          summary=$(printf 'Unauthenticated initialize POST -> HTTP %s\n\n```\n%s\n```\n\nTiming per request (seconds; dns/tcp/tls = connection setup, ttfb = until first byte, total = full response):\n\n```\n%s\n```\n\nHandshake log:\n\n```\n%s\n```\n\nTools:\n\n```\n%s\n```\n\nWrite test:\n\n```\n%s\n```' "$code" "$body" "$timing" "$hs" "$tools" "$wt")
           jq -n --arg name 'report/egress-probe' --arg sha "$GITHUB_SHA" \
                 --arg concl "$concl" --arg summary "$summary" \
             '{name:$name, head_sha:$sha, status:"completed", conclusion:$concl,
