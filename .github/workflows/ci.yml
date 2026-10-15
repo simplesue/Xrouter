@@ -6,9 +6,10 @@ name: CI
 #      repo secrets exist, run the full MCP handshake + workspace_status.
 #   2. tests — install and run the vitest suite, publishing results as an
 #      artifact. Does NOT gate yet: on untouched master (f01fb90) the suite
-#      has 99 pre-existing failures and tests/__baseline__/known-fails.txt
-#      (24 entries) is stale, so a hard gate would be red for unrelated
-#      reasons. Tighten after the baseline is refreshed.
+#      has pre-existing failures and tests/__baseline__/known-fails.txt is
+#      stale, so a hard gate would be red for unrelated reasons. Tighten
+#      after the baseline is refreshed (runner numbers are reproducible:
+#      2594 passed / 236 failed / 59 pending across two runs).
 #
 # Both jobs publish a check run with their findings in the summary. Job
 # logs/artifacts download from Azure blob storage, which some restricted
@@ -30,7 +31,7 @@ jobs:
   egress-probe:
     name: Egress probe (MCP reachability + handshake)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       checks: write
@@ -47,7 +48,7 @@ jobs:
           echo "HTTP $code"
           head -c 500 /tmp/body.txt; echo
 
-      - name: MCP handshake + workspace_status (only when secrets are configured)
+      - name: MCP handshake + workspace_status + tools/list
         env:
           MCP_URL: ${{ secrets.MCP_URL }}
           MCP_TOKEN: ${{ secrets.MCP_TOKEN }}
@@ -72,12 +73,34 @@ jobs:
             echo "session: ${MCP_SID:-<none>}"
             echo '--- notifications/initialized ---'
             post '{"jsonrpc":"2.0","method":"notifications/initialized"}' | head -c 500; echo
-            echo '--- tools/list ---'
-            post '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | head -c 2500; echo
             echo '--- tools/call workspace_status ---'
-            post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_status","arguments":{}}}' | head -c 2500; echo
+            post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_status","arguments":{}}}' | head -c 2000; echo
           } > /tmp/handshake.txt 2>&1 || true
           cat /tmp/handshake.txt
+
+          echo '--- tools/list (180s timeout, 1 retry, parsed to /tmp/tools.txt) ---'
+          if [ -n "${MCP_TOKEN:-}" ] && [ -n "${MCP_URL:-}" ]; then
+            for attempt in 1 2; do
+              curl -sS --max-time 180 -X POST "$MCP_URL" \
+                -H "Authorization: Bearer $MCP_TOKEN" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json, text/event-stream' \
+                ${MCP_SID:+-H "Mcp-Session-Id: $MCP_SID"} \
+                --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+                > /tmp/tools-raw.txt 2>/tmp/tools-err.txt && break
+              echo "tools/list attempt $attempt failed: $(tail -c 200 /tmp/tools-err.txt)"
+            done
+            echo "tools/list raw bytes: $(wc -c < /tmp/tools-raw.txt)"
+            json=$(grep '^data:' /tmp/tools-raw.txt | tail -1 | sed 's/^data: *//')
+            [ -z "$json" ] && json=$(cat /tmp/tools-raw.txt)
+            if echo "$json" | jq -e '.result.tools' > /dev/null 2>&1; then
+              echo "$json" | jq -r '"tools count: \(.result.tools | length)"' > /tmp/tools.txt
+              echo "$json" | jq -r '.result.tools[] | "- \(.name) :: \((.description // "") | gsub("[\\n\\r]+"; " ") | .[0:160])"' >> /tmp/tools.txt
+            else
+              { echo 'tools/list did not parse as JSON-RPC; raw head:'; head -c 1500 /tmp/tools-raw.txt; } > /tmp/tools.txt
+            fi
+            cat /tmp/tools.txt
+          fi
 
       - name: Report via check run (readable over api.github.com)
         if: always()
@@ -86,9 +109,10 @@ jobs:
         run: |
           code=$(cat /tmp/httpcode.txt 2>/dev/null || echo 000)
           body=$(head -c 400 /tmp/body.txt 2>/dev/null || echo '<no body>')
-          hs=$(head -c 2500 /tmp/handshake.txt 2>/dev/null || echo '<handshake not run>')
+          hs=$(head -c 1500 /tmp/handshake.txt 2>/dev/null || echo '<handshake not run>')
+          tools=$(head -c 6000 /tmp/tools.txt 2>/dev/null || echo '<tools/list not run>')
           if [ "$code" != "000" ]; then concl=success; else concl=failure; fi
-          summary=$(printf 'Unauthenticated initialize POST -> HTTP %s\n\n```\n%s\n```\n\nHandshake log:\n\n```\n%s\n```' "$code" "$body" "$hs")
+          summary=$(printf 'Unauthenticated initialize POST -> HTTP %s\n\n```\n%s\n```\n\nHandshake log:\n\n```\n%s\n```\n\nTools:\n\n```\n%s\n```' "$code" "$body" "$hs" "$tools")
           jq -n --arg name 'report/egress-probe' --arg sha "$GITHUB_SHA" \
                 --arg concl "$concl" --arg summary "$summary" \
             '{name:$name, head_sha:$sha, status:"completed", conclusion:$concl,
