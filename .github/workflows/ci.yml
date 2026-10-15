@@ -40,10 +40,12 @@ jobs:
 
       - name: Reachability — POST without credentials (expect an auth error, not a network failure)
         run: |
-          code=$(curl -sS -o /tmp/body.txt -w '%{http_code}' --max-time 30 \
+          out=$(curl -sS -o /tmp/body.txt -w 'code=%{http_code} dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} bytes=%{size_download}' --max-time 30 \
             -X POST 'https://mcp.j0a.cn/mcp/w_0decdbf6f0a138215e12c864' \
             -H 'Content-Type: application/json' \
-            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci-probe","version":"0"}}}' || echo 000)
+            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci-probe","version":"0"}}}' || echo 'code=000')
+          echo "unauthenticated $out" >> /tmp/timing.txt
+          code=$(printf '%s' "$out" | sed -n 's/.*code=\([0-9][0-9]*\).*/\1/p')
           echo "$code" > /tmp/httpcode.txt
           echo "HTTP $code"
           head -c 500 /tmp/body.txt; echo
@@ -60,34 +62,40 @@ jobs:
             fi
             hdr=$(mktemp)
             post() {
-              curl -sS --max-time 60 -D "$hdr" -X POST "$MCP_URL" \
+              # $1 = label, $2 = payload; body -> stdout; one timing line -> /tmp/timing.txt
+              curl -sS --max-time 240 -D "$hdr" -o /tmp/last-body.txt \
+                -w "$1 dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code} bytes=%{size_download}\n" \
+                -X POST "$MCP_URL" \
                 -H "Authorization: Bearer $MCP_TOKEN" \
                 -H 'Content-Type: application/json' \
                 -H 'Accept: application/json, text/event-stream' \
                 ${MCP_SID:+-H "Mcp-Session-Id: $MCP_SID"} \
-                --data "$1" || echo '<curl failed>'
+                --data "$2" >> /tmp/timing.txt || echo "$1 curl_error" >> /tmp/timing.txt
+              cat /tmp/last-body.txt
             }
             echo '--- initialize ---'
-            post '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"xrouter-ci","version":"0.1.0"}}}' | head -c 2000; echo
+            post initialize '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"xrouter-ci","version":"0.1.0"}}}' | head -c 2000; echo
             MCP_SID=$(grep -i '^mcp-session-id:' "$hdr" | tr -d '\r' | awk '{print $2}')
             echo "session: ${MCP_SID:-<none>}"
             echo '--- notifications/initialized ---'
-            post '{"jsonrpc":"2.0","method":"notifications/initialized"}' | head -c 500; echo
+            post initialized '{"jsonrpc":"2.0","method":"notifications/initialized"}' | head -c 500; echo
             echo '--- tools/call workspace_status ---'
-            post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_status","arguments":{}}}' | head -c 2000; echo
+            post workspace_status '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_status","arguments":{}}}' | head -c 2000; echo
           } > /tmp/handshake.txt 2>&1 || true
           cat /tmp/handshake.txt
 
           echo '--- tools/list (180s timeout, 1 retry, parsed to /tmp/tools.txt) ---'
           if [ -n "${MCP_TOKEN:-}" ] && [ -n "${MCP_URL:-}" ]; then
             for attempt in 1 2; do
-              curl -sS --max-time 180 -X POST "$MCP_URL" \
+              curl -sS --max-time 180 -o /tmp/tools-raw.txt \
+                -w "tools/list dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} code=%{http_code} bytes=%{size_download}\n" \
+                -X POST "$MCP_URL" \
                 -H "Authorization: Bearer $MCP_TOKEN" \
                 -H 'Content-Type: application/json' \
                 -H 'Accept: application/json, text/event-stream' \
                 ${MCP_SID:+-H "Mcp-Session-Id: $MCP_SID"} \
                 --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-                > /tmp/tools-raw.txt 2>/tmp/tools-err.txt && break
+                >> /tmp/timing.txt 2>/tmp/tools-err.txt && break
               echo "tools/list attempt $attempt failed: $(tail -c 200 /tmp/tools-err.txt)"
             done
             echo "tools/list raw bytes: $(wc -c < /tmp/tools-raw.txt)"
@@ -111,8 +119,9 @@ jobs:
           body=$(head -c 400 /tmp/body.txt 2>/dev/null || echo '<no body>')
           hs=$(head -c 1500 /tmp/handshake.txt 2>/dev/null || echo '<handshake not run>')
           tools=$(head -c 6000 /tmp/tools.txt 2>/dev/null || echo '<tools/list not run>')
+          timing=$(cat /tmp/timing.txt 2>/dev/null || echo '<no timing captured>')
           if [ "$code" != "000" ]; then concl=success; else concl=failure; fi
-          summary=$(printf 'Unauthenticated initialize POST -> HTTP %s\n\n```\n%s\n```\n\nHandshake log:\n\n```\n%s\n```\n\nTools:\n\n```\n%s\n```' "$code" "$body" "$hs" "$tools")
+          summary=$(printf 'Unauthenticated initialize POST -> HTTP %s\n\n```\n%s\n```\n\nTiming per request (seconds; dns/tcp/tls = connection setup, ttfb = until first byte, total = full response):\n\n```\n%s\n```\n\nHandshake log:\n\n```\n%s\n```\n\nTools:\n\n```\n%s\n```' "$code" "$body" "$timing" "$hs" "$tools")
           jq -n --arg name 'report/egress-probe' --arg sha "$GITHUB_SHA" \
                 --arg concl "$concl" --arg summary "$summary" \
             '{name:$name, head_sha:$sha, status:"completed", conclusion:$concl,
